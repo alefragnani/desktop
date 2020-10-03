@@ -18,12 +18,9 @@ import {
 } from '../../models/repository'
 import { getDotComAPIEndpoint } from '../../lib/api'
 import { hasWritePermission } from '../../models/github-repository'
-import {
-  enableCreateForkFlow,
-  enableSchannelCheckRevokeOptOut,
-} from '../../lib/feature-flag'
+import { enableCreateForkFlow } from '../../lib/feature-flag'
 import { RetryActionType } from '../../models/retry-actions'
-import { sendNonFatalException } from '../../lib/helpers/non-fatal-exception'
+import { parseFilesToBeOverwritten } from '../lib/parse-files-to-be-overwritten'
 
 /** An error which also has a code property. */
 interface IErrorWithCode extends Error {
@@ -184,40 +181,6 @@ export async function gitAuthenticationErrorHandler(
   }
 
   await dispatcher.promptForGenericGitAuthentication(repository, retry)
-
-  return null
-}
-
-/** Handle git clone errors to give chance to retry error. */
-export async function gitCloneErrorHandler(
-  error: Error,
-  dispatcher: Dispatcher
-): Promise<Error | null> {
-  const e = asErrorWithMetadata(error)
-  if (
-    !e ||
-    e.metadata.retryAction == null ||
-    e.metadata.retryAction.type !== RetryActionType.Clone
-  ) {
-    return error
-  }
-
-  const gitError = asGitError(e.underlyingError)
-  if (!gitError) {
-    return error
-  }
-
-  const repository = e.metadata.repository
-  if (!repository) {
-    return error
-  }
-
-  await dispatcher.showPopup({
-    type: PopupType.RetryClone,
-    repository: repository,
-    retryAction: e.metadata.retryAction,
-    errorMessage: e.underlyingError.message,
-  })
 
   return null
 }
@@ -450,7 +413,7 @@ export async function rebaseConflictsHandler(
     return error
   }
 
-  if (!(gitContext.kind === 'merge' || gitContext.kind === 'pull')) {
+  if (gitContext.kind !== 'merge' && gitContext.kind !== 'pull') {
     return error
   }
 
@@ -465,7 +428,7 @@ export async function rebaseConflictsHandler(
  * Handler for when we attempt to checkout a branch and there are some files that would
  * be overwritten.
  */
-export async function localChangesOverwrittenHandler(
+export async function localChangesOverwrittenOnCheckoutHandler(
   error: Error,
   dispatcher: Dispatcher
 ): Promise<Error | null> {
@@ -665,60 +628,54 @@ export async function insufficientGitHubRepoPermissions(
   return null
 }
 
-// Example error message (line breaks added):
-//    fatal: unable to access 'https://github.com/desktop/desktop.git/': schannel:
-//    next InitializeSecurityContext failed: Unknown error (0x80092012) - The
-//    revocation function was unable to check revocation for the certificate.
-//
-// We can't trust anything after the `-` since that string might be localized
-//
-// 0x80092012 is CRYPT_E_NO_REVOCATION_CHECK
-// 0x80092013 is CRYPT_E_REVOCATION_OFFLINE
-//
-// See
-// https://docs.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certverifyrevocation
-// https://github.com/curl/curl/blob/fa009cc798f/lib/vtls/schannel.c#L1069-L1070
-// https://github.com/curl/curl/blob/fa009cc798f/lib/strerror.c#L966
-// https://github.com/curl/curl/blob/fa009cc798f/lib/strerror.c#L983
-const fatalSchannelRevocationErrorRe = /^fatal: unable to access '(.*?)': schannel: next InitializeSecurityContext failed: .*? \((0x80092012|0x80092013)\)/m
-
 /**
- * Attempts to detect whether an error is the result of the
- * Windows SSL backend's (schannel) failure to contact a
- * certificate revocation server. This can only occur on Windows
- * when the `http.sslBackend` is set to `schannel`.
+ * Handler for when an action the user attempts cannot be done because there are local
+ * changes that would get overwritten.
  */
-export async function schannelUnableToCheckRevocationForCertificate(
+export async function localChangesOverwrittenHandler(
   error: Error,
   dispatcher: Dispatcher
-) {
-  if (!__WIN32__) {
+): Promise<Error | null> {
+  const e = asErrorWithMetadata(error)
+  if (e === null) {
     return error
   }
 
-  if (!enableSchannelCheckRevokeOptOut()) {
-    return error
-  }
-
-  const errorWithMetadata = asErrorWithMetadata(error)
-  const underlyingError =
-    errorWithMetadata === null ? error : errorWithMetadata.underlyingError
-
-  const gitError = asGitError(underlyingError)
+  const gitError = asGitError(e.underlyingError)
   if (gitError === null) {
     return error
   }
 
-  const match = fatalSchannelRevocationErrorRe.exec(gitError.message)
-
-  if (!match) {
+  const dugiteError = gitError.result.gitError
+  if (dugiteError === null) {
     return error
   }
 
-  sendNonFatalException('schannelUnableToCheckRevocationForCertificate', error)
+  if (
+    dugiteError !== DugiteError.LocalChangesOverwritten &&
+    dugiteError !== DugiteError.MergeWithLocalChanges &&
+    dugiteError !== DugiteError.RebaseWithLocalChanges
+  ) {
+    return error
+  }
+
+  const { repository } = e.metadata
+
+  if (!(repository instanceof Repository)) {
+    return error
+  }
+
+  if (e.metadata.retryAction === undefined) {
+    return error
+  }
+
+  const files = parseFilesToBeOverwritten(gitError.result.stderr)
+
   dispatcher.showPopup({
-    type: PopupType.SChannelNoRevocationCheck,
-    url: match[1],
+    type: PopupType.LocalChangesOverwritten,
+    repository,
+    retryAction: e.metadata.retryAction,
+    files,
   })
 
   return null
